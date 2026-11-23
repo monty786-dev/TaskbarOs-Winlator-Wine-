@@ -1,7 +1,9 @@
 name: Build explorer.exe (Windows 10 shell for Winlator)
 
 # Run it from the "Actions" tab -> "Build explorer.exe" -> "Run workflow".
-# Result: Actions -> the finished run -> "Artifacts" -> explorer-w10shell
+# Result: open the finished run -> "Artifacts" -> explorer-w10shell
+# If it fails: open the run, tap the step "Show the errors" and copy those lines.
+# The full logs are also in the artifact "build-logs".
 
 on:
   workflow_dispatch:
@@ -161,6 +163,7 @@ jobs:
 
       - name: Configure Wine (only needed to build programs/explorer)
         run: |
+          set -eo pipefail
           mkdir build
           cd build
           ../configure --enable-archs=i386,x86_64 --disable-tests \
@@ -168,14 +171,23 @@ jobs:
             --without-oss --without-cups --without-sane --without-gphoto --without-krb5 \
             --without-pcap --without-usb --without-v4l2 --without-vulkan --without-opencl \
             --without-gstreamer --without-gnutls --without-sdl --without-capi --without-ffmpeg \
-            --without-netapi --without-udev --without-unwind --without-pcsclite
+            --without-netapi --without-udev --without-unwind --without-pcsclite \
+            2>&1 | tee ../configure.log
 
       - name: Build explorer.exe (64-bit and 32-bit)
-        working-directory: build
         run: |
-          set -x
-          make -j"$(nproc)" programs/explorer/x86_64-windows/explorer.exe programs/explorer/i386-windows/explorer.exe \
-            || make -j"$(nproc)"
+          set -eo pipefail
+          cd build
+          # ask make for the real target names instead of guessing them
+          targets="$(make -pRrq : 2>/dev/null | grep -oE '^programs/explorer/[A-Za-z0-9_./+-]*explorer\.exe' | sort -u || true)"
+          echo "explorer targets known to make:"
+          echo "$targets"
+          if [ -z "$targets" ]; then
+            targets="programs/explorer/x86_64-windows/explorer.exe programs/explorer/i386-windows/explorer.exe"
+            echo "none found, trying: $targets"
+          fi
+          echo "$targets" > ../targets.txt
+          make -j"$(nproc)" $targets 2>&1 | tee ../make.log
 
       - name: Collect the result
         run: |
@@ -187,8 +199,8 @@ jobs:
           if [ -n "$f32" ]; then cp "$f32" out/explorer_i386.exe; else echo "::warning::32-bit explorer.exe was not built"; fi
           ls -l out
           file out/*.exe
-          strings -el out/explorer_x86_64.exe | grep -q W10ShellTaskbar \
-            || { echo "::error::w10shell.c is not inside the built explorer.exe"; exit 1; }
+          strings -el out/explorer_x86_64.exe > strings.txt
+          grep -q W10ShellTaskbar strings.txt || { echo "::error::w10shell.c is not inside the built explorer.exe"; exit 1; }
           sha256sum out/*.exe
 
       - name: Upload explorer.exe
@@ -198,12 +210,27 @@ jobs:
           path: out/*.exe
           if-no-files-found: error
 
-      - name: Upload logs if something failed
+      - name: Show the errors
+        if: failure()
+        run: |
+          echo "=============== targets used"
+          cat targets.txt 2>/dev/null || echo "(none)"
+          echo "=============== first error lines in make.log"
+          grep -nE "error:|Error [0-9]+|undefined reference|No rule to make target|fatal error|cannot find|not found" make.log 2>/dev/null | head -n 40 || true
+          echo "=============== last 40 lines of make.log"
+          tail -n 40 make.log 2>/dev/null || true
+          echo "=============== last 25 lines of configure.log"
+          tail -n 25 configure.log 2>/dev/null || true
+
+      - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
-            build/config.log
+            make.log
+            configure.log
+            targets.txt
             programs/explorer/Makefile.in
+            programs/explorer/desktop.c
           if-no-files-found: ignore
