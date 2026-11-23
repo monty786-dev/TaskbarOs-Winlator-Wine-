@@ -955,6 +955,7 @@ static int cur_y, tgt_y;
 static BOOL tb_hidden, ah_hidden, fs_hidden;
 static DWORD reveal_t, hide_t;
 static BOOL reveal_pend, hide_pend;
+static DWORD explorer_pid;
 static HWND desk_hidden[MAX_BTNS];
 static int desk_cnt;
 static BOOL desk_active;
@@ -1002,6 +1003,7 @@ static BOOL CALLBACK enum_win_cb(HWND h, LPARAM lp)
     if (GetWindow(h, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return TRUE;
     GetWindowThreadProcessId(h, &pid);
     if (pid == GetCurrentProcessId() && h != st_hwnd) return TRUE;
+    if (explorer_pid && pid == explorer_pid && h != st_hwnd) return TRUE;
     if (!GetWindowTextW(h, title, NELEM(title))) return TRUE;
 
     for (i = 0; i < btn_cnt; i++) if (btns[i].hwnd == h) break;
@@ -1038,8 +1040,11 @@ static BOOL tb_sync_windows(void)
     BOOL changed = FALSE;
     HWND fg = GetForegroundWindow();
     HWND root = fg ? GetAncestor(fg, GA_ROOTOWNER) : NULL;
+    HWND sh = FindWindowW(L"Shell_TrayWnd", NULL);
     int i;
 
+    explorer_pid = 0;
+    if (sh) GetWindowThreadProcessId(sh, &explorer_pid);
     for (i = 0; i < btn_cnt; i++) btns[i].seen = FALSE;
     EnumWindows(enum_win_cb, (LPARAM)&changed);
     for (i = btn_cnt - 1; i >= 0; i--)
@@ -1506,10 +1511,17 @@ static void tb_menu(void)
     AppendMenuW(m, MF_STRING, 1, L"Taskbar settings");
     AppendMenuW(m, MF_STRING, 2, desk_active ? L"Show open windows" : L"Show the desktop");
     AppendMenuW(m, MF_STRING, 3, L"Task Manager");
+#ifdef W10_STANDALONE
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, 4, L"Exit W10 shell (test mode)");
+#endif
     cmd = popup_menu(tb_hwnd, m, !cfg.top);
     if (cmd == 1) open_settings();
     else if (cmd == 2) toggle_desktop();
     else if (cmd == 3) ShellExecuteW(NULL, L"open", L"taskmgr.exe", NULL, NULL, SW_SHOWNORMAL);
+#ifdef W10_STANDALONE
+    else if (cmd == 4) PostQuitMessage(0);
+#endif
 }
 
 static void tb_click(int part, int idx)
@@ -2566,6 +2578,7 @@ BOOL w10_shell_start(BOOL enable_shell)
     if (!enable_shell || shell_on) return FALSE;
     if (file_exists(L"C:\\w10shell_disable")) { wlog("disabled by C:\\w10shell_disable"); return FALSE; }
 
+#ifndef W10_STANDALONE
     /* crash guard: two early deaths in a row -> fall back to Wine's own taskbar */
     k = open_key();
     if (k)
@@ -2583,6 +2596,9 @@ BOOL w10_shell_start(BOOL enable_shell)
         reg_set(k, L"BootFails", fails + 1);
         RegCloseKey(k);
     }
+#else
+    (void)k; (void)fails;
+#endif
 
     hinst = GetModuleHandleW(NULL);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -2643,3 +2659,45 @@ void w10_shell_attach_tray(void)
     ShowWindow(h, SW_HIDE);
     wlog("attached to Shell_TrayWnd %p", (void *)h);
 }
+
+static BOOL is_shell_desktop(void)
+{
+    WCHAR name[64];
+    DWORD n = 0;
+    HDESK d = GetThreadDesktop(GetCurrentThreadId());
+    name[0] = 0;
+    if (d && GetUserObjectInformationW(d, UOI_NAME, name, sizeof(name), &n)) return !lstrcmpiW(name, L"shell");
+    return FALSE;
+}
+
+/* Fallback hook: called just before explorer enters its message loop. Wine's own taskbar
+ * already exists at this point, so it is simply hidden by w10_shell_attach_tray(). */
+void w10_shell_late(void)
+{
+    if (shell_on || !is_shell_desktop()) return;
+    if (w10_shell_start(TRUE)) w10_shell_attach_tray();
+}
+
+#ifdef W10_STANDALONE
+/* Test build: runs as a normal program next to Wine's own explorer, nothing is replaced. */
+int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
+{
+    MSG msg;
+    RECT wa;
+
+    if (!w10_shell_start(TRUE))
+    {
+        MessageBoxW(NULL, L"The W10 shell could not start.\nCreate an empty file C:\\w10shell.debug, "
+                    L"start it again and read C:\\w10shell.log", L"W10 shell", MB_OK);
+        return 1;
+    }
+    while (GetMessageW(&msg, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    SetRect(&wa, 0, 0, scr_w, scr_h);
+    SystemParametersInfoW(SPI_SETWORKAREA, 0, &wa, SPIF_SENDCHANGE);
+    return 0;
+}
+#endif
