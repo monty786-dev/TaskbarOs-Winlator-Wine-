@@ -1,48 +1,209 @@
-name: Build WinShell
+name: Build explorer.exe (Windows 10 shell for Winlator)
+
+# Run it from the "Actions" tab -> "Build explorer.exe" -> "Run workflow".
+# Result: Actions -> the finished run -> "Artifacts" -> explorer-w10shell
 
 on:
-  push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - name: Get the repository
+        uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 cross compilers
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison gettext pkg-config python3 file binutils \
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+            binutils-mingw-w64-x86-64 binutils-mingw-w64-i686
 
-      - name: Build 64-bit exe
+      - name: Check that w10shell.c was uploaded
         run: |
-          mkdir -p build
-          x86_64-w64-mingw32-gcc -O2 -Wall -municode -mwindows -static-libgcc \
-            -o build/WinShell_x64.exe src/winshell.c \
-            -lgdi32 -luser32 -lshell32 -lole32 -luuid -lcomctl32 -lcomdlg32 \
-            -lshlwapi -ladvapi32 -lgdiplus -lkernel32
+          test -f programs/explorer/w10shell.c || { echo "::error::programs/explorer/w10shell.c is missing"; exit 1; }
+          wc -l programs/explorer/w10shell.c
 
-      - name: Build 32-bit exe
+      - name: Hook the Windows 10 shell into programs/explorer
         run: |
-          i686-w64-mingw32-gcc -O2 -Wall -municode -mwindows -static-libgcc \
-            -o build/WinShell_x86.exe src/winshell.c \
-            -lgdi32 -luser32 -lshell32 -lole32 -luuid -lcomctl32 -lcomdlg32 \
-            -lshlwapi -ladvapi32 -lgdiplus -lkernel32
+          python3 - <<'PYEOF'
+          #!/usr/bin/env python3
+          """Hooks w10shell.c into Wine's programs/explorer (Makefile.in + the initialize_systray call)."""
+          import re
+          import sys
+          import pathlib
 
-      - name: Upload artifacts
+          d = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "programs/explorer")
+
+
+          def die(msg):
+              print("::error::" + msg)
+              sys.exit(1)
+
+
+          if not (d / "w10shell.c").exists():
+              die("w10shell.c is missing in %s - upload it there first" % d)
+
+          # ---------------------------------------------------------------- Makefile.in
+          mk = d / "Makefile.in"
+          text = mk.read_text()
+
+          if "w10shell.c" not in text:
+              lines = text.split("\n")
+              for i, l in enumerate(lines):
+                  if re.match(r"^SOURCES\s*=", l):
+                      if l.rstrip().endswith("\\"):
+                          lines.insert(i + 1, "\tw10shell.c \\")
+                      else:
+                          lines[i] = re.sub(r"^(SOURCES\s*=)\s*", r"\1 w10shell.c ", l)
+                      break
+              else:
+                  die("no SOURCES line in Makefile.in")
+              text = "\n".join(lines)
+
+
+          def var_tokens(var):
+              m = re.search(r"^%s\s*=((?:[^\n]*\\\n)*[^\n]*)$" % var, text, re.M)
+              if not m:
+                  return None, []
+              return m, m.group(1).replace("\\", " ").split()
+
+
+          need = ["uuid", "ole32", "shell32", "comctl32", "user32", "gdi32", "advapi32"]
+          m_imp, imp = var_tokens("IMPORTS")
+          _, delay = var_tokens("DELAYIMPORTS")
+          missing = [n for n in need if n not in imp and n not in delay]
+          if missing:
+              if m_imp:
+                  text = text[:m_imp.end()] + " " + " ".join(missing) + text[m_imp.end():]
+              else:
+                  text = re.sub(r"^(MODULE\s*=[^\n]*)$", r"\1\nIMPORTS = " + " ".join(missing), text, count=1, flags=re.M)
+          mk.write_text(text)
+          print("Makefile.in: added w10shell.c, extra imports: %s" % (missing or "none"))
+
+          # ------------------------------------------------------------ initialize_systray call
+          call = re.compile(r"\binitialize_systray\s*\(")
+
+
+          def split_top(s):
+              out, depth, cur = [], 0, ""
+              for ch in s:
+                  if ch in "([":
+                      depth += 1
+                  elif ch in ")]":
+                      depth -= 1
+                  if ch == "," and depth == 0:
+                      out.append(cur)
+                      cur = ""
+                  else:
+                      cur += ch
+              out.append(cur)
+              return out
+
+
+          patched = 0
+          for p in sorted(d.glob("*.c")):
+              if p.name in ("systray.c", "w10shell.c"):
+                  continue
+              s = p.read_text()
+              if "w10_shell_start" in s:
+                  patched += 1
+                  continue
+              res, pos, changed = [], 0, False
+              for m in call.finditer(s):
+                  if m.start() < pos:
+                      continue
+                  before = s[max(0, m.start() - 40):m.start()]
+                  if re.search(r"\b(void|extern|static|BOOL|int)\s*$", before):
+                      continue                                  # a declaration, not a call
+                  i, depth = m.end(), 1
+                  while i < len(s) and depth:
+                      depth += {"(": 1, ")": -1}.get(s[i], 0)
+                      i += 1
+                  j = i
+                  while j < len(s) and s[j].isspace():
+                      j += 1
+                  if j >= len(s) or s[j] != ";":
+                      continue
+                  args = [a.strip() for a in split_top(s[m.end():i - 1])]
+                  sh = [a for a in args if re.search(r"shell", a, re.I)]
+                  if not sh:
+                      die("%s: no 'shell' argument in: %s" % (p.name, s[m.start():j + 1]))
+                  expr = sh[0]
+                  new_args = ", ".join("(w10_on ? FALSE : %s)" % a if a == expr else a for a in args)
+                  repl = ("{ extern BOOL w10_shell_start( BOOL ); extern void w10_shell_attach_tray( void );\n"
+                          "    BOOL w10_on = w10_shell_start( %s );\n"
+                          "    initialize_systray( %s );\n"
+                          "    if (w10_on) w10_shell_attach_tray(); }" % (expr, new_args))
+                  res.append(s[pos:m.start()])
+                  res.append(repl)
+                  pos = j + 1
+                  changed = True
+              if changed:
+                  res.append(s[pos:])
+                  p.write_text("".join(res))
+                  patched += 1
+                  print("%s: initialize_systray call hooked" % p.name)
+
+          if not patched:
+              die("could not find a call to initialize_systray( ... ); in programs/explorer/*.c. "
+                  "Run: grep -rn initialize_systray programs/explorer   and send the output.")
+          print("patch OK")
+          PYEOF
+          echo "---- patched files"
+          grep -n "w10shell\|w10_shell" programs/explorer/Makefile.in programs/explorer/*.c | grep -v "^programs/explorer/w10shell.c" || true
+
+      - name: Configure Wine (only needed to build programs/explorer)
+        run: |
+          mkdir build
+          cd build
+          ../configure --enable-archs=i386,x86_64 --disable-tests \
+            --without-x --without-freetype --without-wayland --without-alsa --without-pulse \
+            --without-oss --without-cups --without-sane --without-gphoto --without-krb5 \
+            --without-pcap --without-usb --without-v4l2 --without-vulkan --without-opencl \
+            --without-gstreamer --without-gnutls --without-sdl --without-capi --without-ffmpeg \
+            --without-netapi --without-udev --without-unwind --without-pcsclite
+
+      - name: Build explorer.exe (64-bit and 32-bit)
+        working-directory: build
+        run: |
+          set -x
+          make -j"$(nproc)" programs/explorer/x86_64-windows/explorer.exe programs/explorer/i386-windows/explorer.exe \
+            || make -j"$(nproc)"
+
+      - name: Collect the result
+        run: |
+          mkdir -p out
+          f64="$(find build -path '*x86_64-windows/explorer.exe' | head -n1)"
+          f32="$(find build -path '*i386-windows/explorer.exe' | head -n1)"
+          test -n "$f64" || { echo "::error::64-bit explorer.exe was not built"; exit 1; }
+          cp "$f64" out/explorer_x86_64.exe
+          if [ -n "$f32" ]; then cp "$f32" out/explorer_i386.exe; else echo "::warning::32-bit explorer.exe was not built"; fi
+          ls -l out
+          file out/*.exe
+          strings -el out/explorer_x86_64.exe | grep -q W10ShellTaskbar \
+            || { echo "::error::w10shell.c is not inside the built explorer.exe"; exit 1; }
+          sha256sum out/*.exe
+
+      - name: Upload explorer.exe
         uses: actions/upload-artifact@v4
         with:
-          name: WinShell
-          path: build/*.exe
+          name: explorer-w10shell
+          path: out/*.exe
+          if-no-files-found: error
 
-      - name: Publish release (only on tags like v1.0)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Upload logs if something failed
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          files: build/*.exe
+          name: build-logs
+          path: |
+            build/config.log
+            programs/explorer/Makefile.in
+          if-no-files-found: ignore
