@@ -1,12 +1,17 @@
 name: Build explorer.exe (Windows 10 shell for Winlator)
 
 # Start it from the "Actions" tab -> "Build explorer.exe ..." -> "Run workflow".
-# It builds 3 variants at the same time; ANY green one gives you the exe:
-#   fork                          = your repository exactly as it is
-#   upstream-with-your-explorer   = official Wine 10.10 + the programs/explorer folder of your repo
-#   pure-upstream                 = official Wine 10.10 only
-# Result: open the finished run -> "Artifacts" at the bottom.
-# If a variant fails, its first error lines are shown at the top of the run page.
+#
+# JOB 1  "check"  (about 2 minutes): compiles w10shell.c with real Windows headers and gives you
+#                 a TEST version (w10shell_test_x86_64.exe) that you can run in Winlator
+#                 WITHOUT replacing explorer.exe.
+# JOB 2  "build"  (3 variants, 15-40 minutes): builds the real explorer.exe.
+#                 fork                          = your repository exactly as it is
+#                 upstream-with-your-explorer   = official Wine 10.10 + the explorer folder of your repo
+#                 pure-upstream                 = official Wine 10.10 only
+#                 ANY green variant gives you explorer_x86_64.exe and explorer_i386.exe.
+#
+# Errors are written at the top of the run page (red boxes) and into the "build-logs" artifacts.
 
 on:
   workflow_dispatch:
@@ -15,6 +20,52 @@ permissions:
   contents: read
 
 jobs:
+  check:
+    name: check (compile test + test exe)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the repository
+        uses: actions/checkout@v4
+
+      - name: Install mingw
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 binutils-mingw-w64-x86-64 binutils-mingw-w64-i686
+
+      - name: Compile w10shell.c (64-bit and 32-bit test programs)
+        run: |
+          set -eo pipefail
+          src="$(find . -name w10shell.c -not -path './build/*' | head -n1)"
+          test -n "$src" || { echo "::error::w10shell.c was not found anywhere in the repository"; exit 1; }
+          echo "using $src"
+          mkdir -p out
+          for arch in x86_64 i686; do
+            echo "=== $arch"
+            "$arch-w64-mingw32-gcc" -O2 -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
+              -DW10_STANDALONE -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -mwindows -static \
+              "$src" -o "out/w10shell_test_$arch.exe" \
+              -lcomctl32 -lshell32 -lole32 -luuid -lgdi32 -luser32 -ladvapi32 2>&1 | tee "compile_$arch.log"
+          done
+          ls -l out
+
+      - name: Upload the test programs
+        uses: actions/upload-artifact@v4
+        with:
+          name: w10shell-test-exe
+          path: out/*.exe
+          if-no-files-found: error
+
+      - name: Show the compile errors on the run page
+        if: failure()
+        run: |
+          for f in compile_*.log; do
+            [ -f "$f" ] || continue
+            grep -nE "error|undefined reference" "$f" | head -n 12 | while IFS= read -r l; do
+              echo "::error title=compile $f::${l:0:300}"
+            done
+            { echo "### $f"; echo '```'; tail -n 30 "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+
   build:
     name: build (${{ matrix.variant }})
     runs-on: ubuntu-24.04
@@ -47,25 +98,30 @@ jobs:
       - name: Prepare the source tree
         run: |
           set -eo pipefail
-          test -f programs/explorer/w10shell.c || { echo "::error::programs/explorer/w10shell.c is missing - upload it first"; exit 1; }
+          mine="$(find "$GITHUB_WORKSPACE" -name w10shell.c -not -path '*/build/*' | head -n1)"
+          test -n "$mine" || { echo "::error::w10shell.c was not found anywhere in the repository - upload it first"; exit 1; }
+          echo "found $mine"
           if [ "${{ matrix.upstream }}" = "yes" ]; then
             curl -fsSL -o wine.tar.xz https://dl.winehq.org/wine/source/10.x/wine-10.10.tar.xz
             tar xf wine.tar.xz
             if [ "${{ matrix.overlay }}" = "yes" ]; then
+              test -d programs/explorer || { echo "::error::programs/explorer does not exist in your repository"; exit 1; }
               cp -a programs/explorer/. wine-10.10/programs/explorer/
             fi
-            cp -f programs/explorer/w10shell.c wine-10.10/programs/explorer/w10shell.c
+            cp -f "$mine" wine-10.10/programs/explorer/w10shell.c
             echo "SRC=$GITHUB_WORKSPACE/wine-10.10" >> "$GITHUB_ENV"
           else
+            test -d programs/explorer || { echo "::error::programs/explorer does not exist in your repository"; exit 1; }
+            cp -f "$mine" programs/explorer/w10shell.c 2>/dev/null || true
             echo "SRC=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           fi
 
       - name: Hook the Windows 10 shell into programs/explorer
         run: |
           set -eo pipefail
-          python3 - "$SRC/programs/explorer" <<'PYEOF'
+          python3 - "$SRC/programs/explorer" <<'PYEOF' 2>&1 | tee "$GITHUB_WORKSPACE/patch.log"
           #!/usr/bin/env python3
-          """Hooks w10shell.c into Wine's programs/explorer (Makefile.in + the initialize_systray call)."""
+          """Hooks w10shell.c into Wine's programs/explorer (Makefile.in + a call in desktop.c)."""
           import re
           import sys
           import pathlib
@@ -73,15 +129,32 @@ jobs:
           d = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "programs/explorer")
 
 
+          def diagnostics():
+              print("---- files in %s:" % d)
+              print("  " + " ".join(sorted(p.name for p in d.iterdir())))
+              print("---- lines that mention the taskbar / message loop:")
+              n = 0
+              for p in sorted(d.glob("*.c")) + sorted(d.glob("*.h")):
+                  if p.name == "w10shell.c":
+                      continue
+                  for i, line in enumerate(p.read_text(errors="replace").split("\n"), 1):
+                      if re.search(r"systray|taskbar|enable_shell|GetMessageW|manage_desktop", line):
+                          print("%s:%d: %s" % (p.name, i, line.strip()[:150]))
+                          n += 1
+                          if n >= 70:
+                              return
+
+
           def die(msg):
+              diagnostics()
               print("::error::" + msg)
               sys.exit(1)
 
 
           if not (d / "w10shell.c").exists():
-              die("w10shell.c is missing in %s - upload it there first" % d)
+              die("w10shell.c is missing in %s" % d)
 
-          # ---------------------------------------------------------------- Makefile.in
+          # ------------------------------------------------------------------ Makefile.in
           mk = d / "Makefile.in"
           text = mk.read_text()
 
@@ -118,7 +191,7 @@ jobs:
           mk.write_text(text)
           print("Makefile.in: added w10shell.c, extra imports: %s" % (missing or "none"))
 
-          # ------------------------------------------------------------ initialize_systray call
+          # ------------------------------------------------- hook A: the initialize_systray() call
           call = re.compile(r"\binitialize_systray\s*\(")
 
 
@@ -138,54 +211,80 @@ jobs:
               return out
 
 
-          patched = 0
-          for p in sorted(d.glob("*.c")):
-              if p.name in ("systray.c", "w10shell.c"):
-                  continue
-              s = p.read_text()
-              if "w10_shell_start" in s:
-                  patched += 1
-                  continue
-              res, pos, changed = [], 0, False
-              for m in call.finditer(s):
-                  if m.start() < pos:
+          def hook_call():
+              done = 0
+              for p in sorted(d.glob("*.c")):
+                  if p.name in ("systray.c", "w10shell.c"):
                       continue
-                  before = s[max(0, m.start() - 40):m.start()]
-                  if re.search(r"\b(void|extern|static|BOOL|int)\s*$", before):
-                      continue                                  # a declaration, not a call
-                  i, depth = m.end(), 1
-                  while i < len(s) and depth:
-                      depth += {"(": 1, ")": -1}.get(s[i], 0)
-                      i += 1
-                  j = i
-                  while j < len(s) and s[j].isspace():
-                      j += 1
-                  if j >= len(s) or s[j] != ";":
+                  s = p.read_text()
+                  if "w10_shell_start" in s:
+                      done += 1
                       continue
-                  args = [a.strip() for a in split_top(s[m.end():i - 1])]
-                  sh = [a for a in args if re.search(r"shell", a, re.I)]
-                  if not sh:
-                      die("%s: no 'shell' argument in: %s" % (p.name, s[m.start():j + 1]))
-                  expr = sh[0]
-                  new_args = ", ".join("(w10_on ? FALSE : %s)" % a if a == expr else a for a in args)
-                  repl = ("{ extern BOOL w10_shell_start( BOOL ); extern void w10_shell_attach_tray( void );\n"
-                          "    BOOL w10_on = w10_shell_start( %s );\n"
-                          "    initialize_systray( %s );\n"
-                          "    if (w10_on) w10_shell_attach_tray(); }" % (expr, new_args))
-                  res.append(s[pos:m.start()])
-                  res.append(repl)
-                  pos = j + 1
-                  changed = True
-              if changed:
-                  res.append(s[pos:])
-                  p.write_text("".join(res))
-                  patched += 1
-                  print("%s: initialize_systray call hooked" % p.name)
+                  res, pos, changed = [], 0, False
+                  for m in call.finditer(s):
+                      if m.start() < pos:
+                          continue
+                      before = s[max(0, m.start() - 40):m.start()]
+                      if re.search(r"\b(void|extern|static|BOOL|int)\s*$", before):
+                          continue                                  # a declaration, not a call
+                      i, depth = m.end(), 1
+                      while i < len(s) and depth:
+                          depth += {"(": 1, ")": -1}.get(s[i], 0)
+                          i += 1
+                      j = i
+                      while j < len(s) and s[j].isspace():
+                          j += 1
+                      if j >= len(s) or s[j] != ";":
+                          continue
+                      args = [a.strip() for a in split_top(s[m.end():i - 1])]
+                      sh = [a for a in args if re.search(r"shell", a, re.I)]
+                      if not sh:
+                          continue
+                      expr = sh[0]
+                      new_args = ", ".join("(w10_on ? FALSE : %s)" % a if a == expr else a for a in args)
+                      res.append(s[pos:m.start()])
+                      res.append("{ extern BOOL w10_shell_start( BOOL ); extern void w10_shell_attach_tray( void );\n"
+                                 "    BOOL w10_on = w10_shell_start( %s );\n"
+                                 "    initialize_systray( %s );\n"
+                                 "    if (w10_on) w10_shell_attach_tray(); }" % (expr, new_args))
+                      pos = j + 1
+                      changed = True
+                  if changed:
+                      res.append(s[pos:])
+                      p.write_text("".join(res))
+                      print("hook A: %s - initialize_systray call replaced" % p.name)
+                      done += 1
+              return done
 
-          if not patched:
-              die("could not find a call to initialize_systray( ... ); in programs/explorer/*.c. "
-                  "Run: grep -rn initialize_systray programs/explorer   and send the output.")
-          print("patch OK")
+
+          # -------------------------------------- hook B: just before manage_desktop()'s message loop
+          def hook_loop():
+              for p in sorted(d.glob("*.c")):
+                  if p.name == "w10shell.c":
+                      continue
+                  s = p.read_text()
+                  if "w10_shell_late" in s:
+                      return True
+                  m = re.search(r"\bmanage_desktop\s*\([^)]*\)\s*\{", s)
+                  if not m:
+                      continue
+                  lm = re.search(r"\n([ \t]*)while\s*\(\s*GetMessageW\s*\(", s[m.end():])
+                  if not lm:
+                      continue
+                  at = m.end() + lm.start()
+                  s = s[:at] + "\n%s{ extern void w10_shell_late( void ); w10_shell_late(); }" % lm.group(1) + s[at:]
+                  p.write_text(s)
+                  print("hook B: %s - w10_shell_late() added before the message loop of manage_desktop" % p.name)
+                  return True
+              return False
+
+
+          if hook_call():
+              print("patch OK (hook A)")
+          elif hook_loop():
+              print("patch OK (hook B)")
+          else:
+              die("could not find where to hook in: no initialize_systray(...) call and no message loop in manage_desktop().")
           PYEOF
           echo "---- patched lines"
           grep -n "w10shell\|w10_shell" "$SRC"/programs/explorer/Makefile.in "$SRC"/programs/explorer/*.c | grep -v "/w10shell.c:" || true
@@ -241,19 +340,19 @@ jobs:
         if: failure()
         run: |
           cd "$GITHUB_WORKSPACE"
-          for f in configure.log make.log; do
+          for f in patch.log configure.log make.log; do
             [ -f "$f" ] || continue
-            grep -nE "error:|undefined reference|No rule to make target|fatal error|cannot find|configure: error" "$f" | head -n 12 | while IFS= read -r l; do
+            grep -nE "error:|::error|undefined reference|No rule to make target|fatal error|cannot find|configure: error" "$f" | head -n 12 | while IFS= read -r l; do
               echo "::error title=${{ matrix.variant }} / $f::${l:0:300}"
             done
           done
           {
             echo "### ${{ matrix.variant }}: build failed"
-            for f in configure.log make.log; do
+            for f in patch.log configure.log make.log; do
               [ -f "$f" ] || continue
               echo "Last lines of $f:"
               echo '```'
-              tail -n 25 "$f"
+              tail -n 40 "$f"
               echo '```'
             done
           } >> "$GITHUB_STEP_SUMMARY"
@@ -264,6 +363,7 @@ jobs:
         with:
           name: build-logs-${{ matrix.variant }}
           path: |
+            patch.log
             make.log
             configure.log
             targets.txt
