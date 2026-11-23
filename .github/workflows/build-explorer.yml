@@ -1,13 +1,18 @@
 name: Build explorer.exe (Windows 10 shell for Winlator)
 
+# THIS repository only needs two things:
+#     w10shell.c                              (in the main folder)
+#     .github/workflows/build-explorer.yml    (this file)
+# The Wine source (brunodev85/wine-10.10-custom) is downloaded automatically while the build runs.
+#
 # Start it from the "Actions" tab -> "Build explorer.exe ..." -> "Run workflow".
 #
-# JOB 1  "check"  (about 2 minutes): compiles w10shell.c with real Windows headers and gives you
-#                 a TEST version (w10shell_test_x86_64.exe) that you can run in Winlator
-#                 WITHOUT replacing explorer.exe.
-# JOB 2  "build"  (3 variants, 15-40 minutes): builds the real explorer.exe.
-#                 fork                          = your repository exactly as it is
-#                 upstream-with-your-explorer   = official Wine 10.10 + the explorer folder of your repo
+# JOB 1  "check"  (about 2 minutes): compiles w10shell.c with real Windows headers and makes a TEST
+#                 program (w10shell_test_x86_64.exe) that you can run in Winlator WITHOUT replacing
+#                 explorer.exe.
+# JOB 2  "build"  (3 variants, 15-40 minutes): builds the real explorer.exe
+#                 fork                          = brunodev85's repository exactly as it is
+#                 upstream-with-your-explorer   = official Wine 10.10 + the explorer folder of that repository
 #                 pure-upstream                 = official Wine 10.10 only
 #                 ANY green variant gives you explorer_x86_64.exe and explorer_i386.exe.
 #
@@ -15,6 +20,15 @@ name: Build explorer.exe (Windows 10 shell for Winlator)
 
 on:
   workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Repository with the Wine source (owner/name)"
+        required: false
+        default: "brunodev85/wine-10.10-custom"
+      source_ref:
+        description: "Branch or tag of that repository"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
@@ -24,7 +38,7 @@ jobs:
     name: check (compile test + test exe)
     runs-on: ubuntu-24.04
     steps:
-      - name: Get the repository
+      - name: Get this repository
         uses: actions/checkout@v4
 
       - name: Install mingw
@@ -35,8 +49,8 @@ jobs:
       - name: Compile w10shell.c (64-bit and 32-bit test programs)
         run: |
           set -eo pipefail
-          src="$(find . -name w10shell.c -not -path './build/*' | head -n1)"
-          test -n "$src" || { echo "::error::w10shell.c was not found anywhere in the repository"; exit 1; }
+          src="$(find . -name w10shell.c | head -n1)"
+          test -n "$src" || { echo "::error::w10shell.c was not found - upload it to the main folder of this repository"; exit 1; }
           echo "using $src"
           mkdir -p out
           for arch in x86_64 i686; do
@@ -84,8 +98,18 @@ jobs:
             upstream: "yes"
             overlay: "no"
     steps:
-      - name: Get the repository
+      - name: Get this repository (w10shell.c)
         uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Get the Wine source repository
+        if: matrix.upstream == 'no' || matrix.overlay == 'yes'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo || 'brunodev85/wine-10.10-custom' }}
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: wine-src
 
       - name: Install build tools
         run: |
@@ -98,23 +122,23 @@ jobs:
       - name: Prepare the source tree
         run: |
           set -eo pipefail
-          mine="$(find "$GITHUB_WORKSPACE" -name w10shell.c -not -path '*/build/*' | head -n1)"
-          test -n "$mine" || { echo "::error::w10shell.c was not found anywhere in the repository - upload it first"; exit 1; }
-          echo "found $mine"
+          mine="$GITHUB_WORKSPACE/mine/w10shell.c"
+          test -f "$mine" || { echo "::error::w10shell.c must be in the main folder of THIS repository"; exit 1; }
           if [ "${{ matrix.upstream }}" = "yes" ]; then
             curl -fsSL -o wine.tar.xz https://dl.winehq.org/wine/source/10.x/wine-10.10.tar.xz
             tar xf wine.tar.xz
             if [ "${{ matrix.overlay }}" = "yes" ]; then
-              test -d programs/explorer || { echo "::error::programs/explorer does not exist in your repository"; exit 1; }
-              cp -a programs/explorer/. wine-10.10/programs/explorer/
+              test -d wine-src/programs/explorer || { echo "::error::programs/explorer was not found in the Wine source repository"; exit 1; }
+              cp -a wine-src/programs/explorer/. wine-10.10/programs/explorer/
             fi
             cp -f "$mine" wine-10.10/programs/explorer/w10shell.c
             echo "SRC=$GITHUB_WORKSPACE/wine-10.10" >> "$GITHUB_ENV"
           else
-            test -d programs/explorer || { echo "::error::programs/explorer does not exist in your repository"; exit 1; }
-            cp -f "$mine" programs/explorer/w10shell.c 2>/dev/null || true
-            echo "SRC=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+            test -d wine-src/programs/explorer || { echo "::error::programs/explorer was not found in the Wine source repository"; exit 1; }
+            cp -f "$mine" wine-src/programs/explorer/w10shell.c
+            echo "SRC=$GITHUB_WORKSPACE/wine-src" >> "$GITHUB_ENV"
           fi
+          echo "Wine source commit:"; git -C wine-src log -1 --oneline 2>/dev/null || true
 
       - name: Hook the Windows 10 shell into programs/explorer
         run: |
