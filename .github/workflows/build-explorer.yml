@@ -1,9 +1,12 @@
 name: Build explorer.exe (Windows 10 shell for Winlator)
 
-# Run it from the "Actions" tab -> "Build explorer.exe" -> "Run workflow".
-# Result: open the finished run -> "Artifacts" -> explorer-w10shell
-# If it fails: open the run, tap the step "Show the errors" and copy those lines.
-# The full logs are also in the artifact "build-logs".
+# Start it from the "Actions" tab -> "Build explorer.exe ..." -> "Run workflow".
+# It builds 3 variants at the same time; ANY green one gives you the exe:
+#   fork                          = your repository exactly as it is
+#   upstream-with-your-explorer   = official Wine 10.10 + the programs/explorer folder of your repo
+#   pure-upstream                 = official Wine 10.10 only
+# Result: open the finished run -> "Artifacts" at the bottom.
+# If a variant fails, its first error lines are shown at the top of the run page.
 
 on:
   workflow_dispatch:
@@ -13,8 +16,22 @@ permissions:
 
 jobs:
   build:
+    name: build (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: fork
+            upstream: "no"
+            overlay: "no"
+          - variant: upstream-with-your-explorer
+            upstream: "yes"
+            overlay: "yes"
+          - variant: pure-upstream
+            upstream: "yes"
+            overlay: "no"
     steps:
       - name: Get the repository
         uses: actions/checkout@v4
@@ -23,18 +40,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential flex bison gettext pkg-config python3 file binutils \
+            build-essential flex bison gettext pkg-config python3 file binutils curl xz-utils \
             gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
             binutils-mingw-w64-x86-64 binutils-mingw-w64-i686
 
-      - name: Check that w10shell.c was uploaded
+      - name: Prepare the source tree
         run: |
-          test -f programs/explorer/w10shell.c || { echo "::error::programs/explorer/w10shell.c is missing"; exit 1; }
-          wc -l programs/explorer/w10shell.c
+          set -eo pipefail
+          test -f programs/explorer/w10shell.c || { echo "::error::programs/explorer/w10shell.c is missing - upload it first"; exit 1; }
+          if [ "${{ matrix.upstream }}" = "yes" ]; then
+            curl -fsSL -o wine.tar.xz https://dl.winehq.org/wine/source/10.x/wine-10.10.tar.xz
+            tar xf wine.tar.xz
+            if [ "${{ matrix.overlay }}" = "yes" ]; then
+              cp -a programs/explorer/. wine-10.10/programs/explorer/
+            fi
+            cp -f programs/explorer/w10shell.c wine-10.10/programs/explorer/w10shell.c
+            echo "SRC=$GITHUB_WORKSPACE/wine-10.10" >> "$GITHUB_ENV"
+          else
+            echo "SRC=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          fi
 
       - name: Hook the Windows 10 shell into programs/explorer
         run: |
-          python3 - <<'PYEOF'
+          set -eo pipefail
+          python3 - "$SRC/programs/explorer" <<'PYEOF'
           #!/usr/bin/env python3
           """Hooks w10shell.c into Wine's programs/explorer (Makefile.in + the initialize_systray call)."""
           import re
@@ -158,42 +187,40 @@ jobs:
                   "Run: grep -rn initialize_systray programs/explorer   and send the output.")
           print("patch OK")
           PYEOF
-          echo "---- patched files"
-          grep -n "w10shell\|w10_shell" programs/explorer/Makefile.in programs/explorer/*.c | grep -v "^programs/explorer/w10shell.c" || true
+          echo "---- patched lines"
+          grep -n "w10shell\|w10_shell" "$SRC"/programs/explorer/Makefile.in "$SRC"/programs/explorer/*.c | grep -v "/w10shell.c:" || true
 
       - name: Configure Wine (only needed to build programs/explorer)
         run: |
           set -eo pipefail
-          mkdir build
-          cd build
+          mkdir -p "$SRC/build"
+          cd "$SRC/build"
           ../configure --enable-archs=i386,x86_64 --disable-tests \
             --without-x --without-freetype --without-wayland --without-alsa --without-pulse \
             --without-oss --without-cups --without-sane --without-gphoto --without-krb5 \
             --without-pcap --without-usb --without-v4l2 --without-vulkan --without-opencl \
             --without-gstreamer --without-gnutls --without-sdl --without-capi --without-ffmpeg \
             --without-netapi --without-udev --without-unwind --without-pcsclite \
-            2>&1 | tee ../configure.log
+            2>&1 | tee "$GITHUB_WORKSPACE/configure.log"
 
       - name: Build explorer.exe (64-bit and 32-bit)
         run: |
           set -eo pipefail
-          cd build
-          # ask make for the real target names instead of guessing them
+          cd "$SRC/build"
           targets="$(make -pRrq : 2>/dev/null | grep -oE '^programs/explorer/[A-Za-z0-9_./+-]*explorer\.exe' | sort -u || true)"
-          echo "explorer targets known to make:"
-          echo "$targets"
+          echo "explorer targets known to make:"; echo "$targets"
           if [ -z "$targets" ]; then
             targets="programs/explorer/x86_64-windows/explorer.exe programs/explorer/i386-windows/explorer.exe"
             echo "none found, trying: $targets"
           fi
-          echo "$targets" > ../targets.txt
-          make -j"$(nproc)" $targets 2>&1 | tee ../make.log
+          echo "$targets" > "$GITHUB_WORKSPACE/targets.txt"
+          make -j"$(nproc)" $targets 2>&1 | tee "$GITHUB_WORKSPACE/make.log"
 
       - name: Collect the result
         run: |
           mkdir -p out
-          f64="$(find build -path '*x86_64-windows/explorer.exe' | head -n1)"
-          f32="$(find build -path '*i386-windows/explorer.exe' | head -n1)"
+          f64="$(find "$SRC/build" -path '*x86_64-windows/explorer.exe' | head -n1)"
+          f32="$(find "$SRC/build" -path '*i386-windows/explorer.exe' | head -n1)"
           test -n "$f64" || { echo "::error::64-bit explorer.exe was not built"; exit 1; }
           cp "$f64" out/explorer_x86_64.exe
           if [ -n "$f32" ]; then cp "$f32" out/explorer_i386.exe; else echo "::warning::32-bit explorer.exe was not built"; fi
@@ -206,31 +233,38 @@ jobs:
       - name: Upload explorer.exe
         uses: actions/upload-artifact@v4
         with:
-          name: explorer-w10shell
+          name: explorer-w10shell-${{ matrix.variant }}
           path: out/*.exe
           if-no-files-found: error
 
-      - name: Show the errors
+      - name: Show the errors on the run page
         if: failure()
         run: |
-          echo "=============== targets used"
-          cat targets.txt 2>/dev/null || echo "(none)"
-          echo "=============== first error lines in make.log"
-          grep -nE "error:|Error [0-9]+|undefined reference|No rule to make target|fatal error|cannot find|not found" make.log 2>/dev/null | head -n 40 || true
-          echo "=============== last 40 lines of make.log"
-          tail -n 40 make.log 2>/dev/null || true
-          echo "=============== last 25 lines of configure.log"
-          tail -n 25 configure.log 2>/dev/null || true
+          cd "$GITHUB_WORKSPACE"
+          for f in configure.log make.log; do
+            [ -f "$f" ] || continue
+            grep -nE "error:|undefined reference|No rule to make target|fatal error|cannot find|configure: error" "$f" | head -n 12 | while IFS= read -r l; do
+              echo "::error title=${{ matrix.variant }} / $f::${l:0:300}"
+            done
+          done
+          {
+            echo "### ${{ matrix.variant }}: build failed"
+            for f in configure.log make.log; do
+              [ -f "$f" ] || continue
+              echo "Last lines of $f:"
+              echo '```'
+              tail -n 25 "$f"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-${{ matrix.variant }}
           path: |
             make.log
             configure.log
             targets.txt
-            programs/explorer/Makefile.in
-            programs/explorer/desktop.c
           if-no-files-found: ignore
